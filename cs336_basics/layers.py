@@ -2,7 +2,7 @@ import torch
 from torch.nn import Module, Parameter
 from torch.nn.init import trunc_normal_
 from einops import einsum, reduce, rearrange
-from .functions import SiLU
+from .functions import SiLU, scaled_dot_product_attention
 
 
 class Linear(Module):
@@ -126,15 +126,6 @@ class RotaryPositionalEmbedding(Module):
         self.register_buffer("sin", sin, persistent=False)
         self.register_buffer("cos", cos, persistent=False)
 
-        # R = torch.zeros((max_seq_len, d_k // 2, 2, 2))
-        # for i in range(max_seq_len):
-        #     for k in range(1, d_k/2 + 1):
-        #         theta_ik = i / (self.theta ** ((2*k - 2)/d_k))
-        #         R[i, k] = [
-        #             [cos(theta_ik), -sin(theta_ik)],
-        #             [sin(theta_ik), cos(theta_ik)]
-        #         ]
-        # self.register_buffer("R", R, persistent=False)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """Apply ROPE to input vector x.
@@ -147,8 +138,7 @@ class RotaryPositionalEmbedding(Module):
             torch.Tensor: same shape as x
         """
 
-        # You should use the token positions to slice your (possibly precomputed)
-        # cos and sin tensors along the sequence dimension.
+        # use the token positions to slice cos and sin tensors along the sequence dimension
         cos = self.cos[token_positions]
         sin = self.sin[token_positions]
         x_odd = x[..., 0::2]
@@ -157,5 +147,70 @@ class RotaryPositionalEmbedding(Module):
         new_x_odd = cos * x_odd - sin * x_even
         new_x_even = sin * x_odd + cos * x_even
         result = rearrange([new_x_odd, new_x_even], "h ... num_pairs -> ... (num_pairs h)")
+
+        return result
+
+
+class MHSA(Module):
+    def __init__(self, d_model: int, num_heads: int, rope=False,
+                 theta=10000, max_seq_len=256, device=None, dtype=None):
+        """Causal multi-head self-attention.
+
+        Args:
+            d_model (int): Dimensionality of the Transformer block inputs
+            num_heads (int): Number of heads to use in multi-head self-attention
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_v = self.d_k = d_model // num_heads
+
+        self.q_proj = Linear(d_model, num_heads * self.d_k, device, dtype)
+        self.k_proj = Linear(d_model, num_heads * self.d_k, device, dtype)
+        self.v_proj = Linear(d_model, num_heads * self.d_v, device, dtype)
+        self.output_proj = Linear(num_heads * self.d_v, d_model, device, dtype)
+        if rope:
+            self.rope = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device)
+        else:
+            self.rope = None
+
+    def forward(self, x: torch.Tensor, token_positions=None) -> torch.Tensor:
+        """Implementation of multi-head attention.
+
+        Args:
+            x (torch.Tensor, "... seq_len d_model"): input tensor
+            token_positions (torch.Tensor): tensor of shape (..., seq_len)
+            specifying the token positions of 𝑥 along the sequence dimension
+
+        Returns:
+            torch.Tensor: output of multi-head self attention
+        """
+        # 1. computing the key, value, and query projection
+        queries = self.q_proj(x)  # (..., seq, h*d_k)
+        keys = self.k_proj(x)     # same
+        values = self.v_proj(x)   # (..., seq, h*d_v)
+        queries = rearrange(queries, "... seq (h d_k) -> ... h seq d_k", h=self.num_heads)
+        keys = rearrange(keys, "... seq (h d_k) -> ... h seq d_k", h=self.num_heads)
+        values = rearrange(values, "... seq (h d_v) -> ... h seq d_v", h=self.num_heads)
+        seq_len = queries.shape[-2]  # how many tokens in input
+
+        # 2. Rope
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device)
+                token_positions = rearrange(token_positions, "seq -> 1 seq")
+            queries = self.rope(queries, token_positions)
+            keys = self.rope(keys, token_positions)
+
+        # 3. Causal masking
+        mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device)
+        mask = torch.tril(mask)   # lower-triangular
+
+        # 4. apply self-attention
+        multihead = scaled_dot_product_attention(queries, keys, values, mask)
+
+        # 5. project back
+        multihead = rearrange(multihead, "... h seq d_v -> ... seq (h d_v)", h=self.num_heads)
+        result = self.output_proj(multihead)
 
         return result

@@ -2,6 +2,7 @@ import torch
 from torch.nn import Module, Parameter
 from torch.nn.init import trunc_normal_
 from einops import einsum, reduce, rearrange
+from .functions import SiLU
 
 
 class Linear(Module):
@@ -76,10 +77,6 @@ class RMSNorm(Module):
         result = (x / rms) * self.weight
 
         return result.to(dtype=in_dtype)
-
-
-def SiLU(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
 
 
 class FFNN(Module):

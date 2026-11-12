@@ -10,7 +10,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.layers import Linear, Embedding, RMSNorm, FFNN, \
-    RotaryPositionalEmbedding, MHSA
+    RotaryPositionalEmbedding, MHSA, TransformerBlock
 from cs336_basics.functions import SiLU, softmax, scaled_dot_product_attention
 
 
@@ -299,7 +299,11 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    layer = TransformerBlock(d_model, num_heads, d_ff, rope=True,
+                             max_seq_len=max_seq_len, theta=theta)
+    layer.load_state_dict(weights)
+    result = layer(in_features)
+    return result
 
 
 def run_transformer_lm(

@@ -152,7 +152,7 @@ class RotaryPositionalEmbedding(Module):
 
 
 class MHSA(Module):
-    def __init__(self, d_model: int, num_heads: int, rope=False,
+    def __init__(self, d_model: int, num_heads: int, rope=None,
                  theta=10000, max_seq_len=256, device=None, dtype=None):
         """Causal multi-head self-attention.
 
@@ -169,7 +169,7 @@ class MHSA(Module):
         self.k_proj = Linear(d_model, num_heads * self.d_k, device, dtype)
         self.v_proj = Linear(d_model, num_heads * self.d_v, device, dtype)
         self.output_proj = Linear(num_heads * self.d_v, d_model, device, dtype)
-        if rope:
+        if rope is not None:
             self.rope = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device)
         else:
             self.rope = None
@@ -213,4 +213,31 @@ class MHSA(Module):
         multihead = rearrange(multihead, "... h seq d_v -> ... seq (h d_v)", h=self.num_heads)
         result = self.output_proj(multihead)
 
+        return result
+
+
+class TransformerBlock(Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, rope=None,
+                 max_seq_len=256, theta=10000, device=None):
+        """Pre-norm Transformer block: causal MHSA and SwiGLU FFN,
+        each wrapped as x + sublayer(RMSNorm(x)).
+
+        Args:
+            d_model (int): Dimensionality of the Transformer block inputs.
+            num_heads (int): Number of heads to use in multi-head self-attention.
+            d_ff (int): Dimensionality of the position-wise feed-forward inner layer.
+            rope (bool | None): If truthy, apply RoPE to queries and keys.
+            max_seq_len (int): Maximum sequence length for the RoPE cos/sin tables.
+            theta (float): RoPE Θ value.
+            device (torch.device | None): Device to create parameters and buffers on.
+        """
+        super().__init__()
+        self.ln1 = RMSNorm(d_model, device=device)
+        self.attn = MHSA(d_model, num_heads, rope, theta, max_seq_len, device)
+        self.ln2 = RMSNorm(d_model, device=device)
+        self.ffn = FFNN(d_model, d_ff, device, func='SwiGLU')
+
+    def forward(self, x: torch.Tensor):
+        x1 = x + self.attn(self.ln1(x))
+        result = x1 + self.ffn(self.ln2(x1))
         return result
